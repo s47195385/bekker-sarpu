@@ -15,6 +15,7 @@ from sarpu.input_output import *
 from sarpu.labeling_mechanisms import parse_labeling_model
 from sarpu.paths_and_names import *
 from sarpu.pu_learning import *
+from sarpu.PUmodels import PU_CLASSIFIER_REGISTRY
 from tice import tice
 
 
@@ -189,9 +190,12 @@ def parse_cl_atts(string):
 
 
 def parse_model(string):
-    return {
-        "lr": LogisticRegressionPU,
-    }[string]
+    try:
+        return PU_CLASSIFIER_REGISTRY[string]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unknown model type '{string}'. Available options are: {', '.join(sorted(PU_CLASSIFIER_REGISTRY))}."
+        ) from exc
 
 
 def evaluate_classification(real, pred):
