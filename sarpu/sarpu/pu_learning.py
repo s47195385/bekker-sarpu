@@ -1,7 +1,59 @@
+from typing import Any, Dict, Optional, Type, Union
+
 import numpy as np
-import sklearn.linear_model
 import time
-from sarpu.PUmodels import *
+from sklearn.base import BaseEstimator
+
+from sarpu.PUmodels import BasePU, LogisticRegressionPU, PU_CLASSIFIER_REGISTRY
+
+
+def _resolve_pu_model(
+    model: Union[str, BaseEstimator, Type[BaseEstimator], None],
+    model_kwargs: Optional[Dict[str, Any]] = None,
+    default_cls: Type[BaseEstimator] = LogisticRegressionPU,
+) -> BaseEstimator:
+    """Instantiate or return a PU-compatible model.
+
+    Parameters
+    ----------
+    model:
+        Either a string key registered in :data:`PU_CLASSIFIER_REGISTRY`, a
+        scikit-learn estimator instance, an estimator class, or ``None``.
+    model_kwargs:
+        Optional keyword arguments used when instantiating a model class.
+    default_cls:
+        Class used when ``model`` is ``None``.
+
+    Returns
+    -------
+    BaseEstimator
+        An instantiated estimator ready to be used inside the SAR-EM pipeline.
+    """
+
+    if model_kwargs is None:
+        model_kwargs = {}
+
+    if model is None:
+        model_cls = default_cls
+    elif isinstance(model, str):
+        try:
+            model_cls = PU_CLASSIFIER_REGISTRY[model]
+        except KeyError as exc:
+            raise ValueError(
+                f"Unknown model alias '{model}'. Available options are: {', '.join(sorted(PU_CLASSIFIER_REGISTRY))}."
+            ) from exc
+    elif isinstance(model, type):
+        model_cls = model
+    elif isinstance(model, BaseEstimator):
+        if model_kwargs:
+            raise ValueError("'model_kwargs' cannot be provided when passing an estimator instance.")
+        return model
+    else:
+        raise TypeError(
+            "Model specification must be a string alias, estimator class, estimator instance, or None."
+        )
+
+    return model_cls(**model_kwargs)
 
 
 
@@ -142,6 +194,79 @@ def pu_learn_sar_em(x,
 
     return classification_model, propensity_model, info
 
+
+def run_sar_em_pipeline(
+    x,
+    s,
+    propensity_attributes,
+    *,
+    classification_model: Union[str, BaseEstimator, Type[BaseEstimator], None] = None,
+    classification_model_kwargs: Optional[Dict[str, Any]] = None,
+    propensity_model: Union[str, BaseEstimator, Type[BaseEstimator], None] = None,
+    propensity_model_kwargs: Optional[Dict[str, Any]] = None,
+    classification_attributes=None,
+    threshold_objective: Optional[float] = None,
+    **sar_em_kwargs,
+):
+    """Convenience wrapper around :func:`pu_learn_sar_em`.
+
+    This helper instantiates the requested models (accepting the same shorthand
+    strings used in the command-line interface), forwards all keyword
+    arguments to :func:`pu_learn_sar_em`, and collects the resulting artefacts
+    in a single dictionary. The wrapper makes it easier to experiment with
+    alternative classifiers while keeping the SAR-EM training API compact.
+
+    Parameters
+    ----------
+    x, s, propensity_attributes
+        See :func:`pu_learn_sar_em`.
+    classification_model, propensity_model
+        Model specifications accepted by :func:`_resolve_pu_model`. When
+        provided as strings they must be keys of
+        :data:`PU_CLASSIFIER_REGISTRY`.
+    classification_model_kwargs, propensity_model_kwargs
+        Optional keyword arguments passed to the instantiated models. Use these
+        to, for example, set ``n_jobs=-1`` to leverage all available CPU cores.
+    threshold_objective
+        Optional metadata describing the thresholding objective that triggered
+        the training run. The value is attached to the returned ``info``
+        dictionary for downstream consumption.
+    **sar_em_kwargs
+        Additional keyword arguments forwarded to :func:`pu_learn_sar_em`.
+
+    Returns
+    -------
+    dict
+        Dictionary with the trained ``classification_model``,
+        ``propensity_model`` and the ``info`` dictionary produced by
+        :func:`pu_learn_sar_em`.
+    """
+
+    classification_estimator = _resolve_pu_model(
+        classification_model, classification_model_kwargs, LogisticRegressionPU
+    )
+    propensity_estimator = _resolve_pu_model(
+        propensity_model, propensity_model_kwargs, LogisticRegressionPU
+    )
+
+    trained_classifier, trained_propensity, info = pu_learn_sar_em(
+        x,
+        s,
+        propensity_attributes,
+        classification_attributes=classification_attributes,
+        classification_model=classification_estimator,
+        propensity_model=propensity_estimator,
+        **sar_em_kwargs,
+    )
+
+    if threshold_objective is not None:
+        info['threshold_objective'] = threshold_objective
+
+    return {
+        'classification_model': trained_classifier,
+        'propensity_model': trained_propensity,
+        'info': info,
+    }
 
 
 def initialize_simple(instances, labels, classification_model, propensity_model):
