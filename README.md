@@ -135,21 +135,24 @@ The labellings are saved in the data director under `<dataset>/processed/labelin
 
 For programmatic workflows, the helper `sarpu.pu_learning.run_sar_em_pipeline` wraps `pu_learn_sar_em` so you can supply the dataset, propensity configuration, model aliases (or fully specified estimators), threshold objectives, and any estimator arguments (such as `n_jobs=-1`) through a single call. The function returns a dictionary with the fitted classification model, propensity model and the training metadata.
 
-If you prefer to reproduce the Jiang et al. figures/tables independently for each classifier, the module `sarpu.sarpu.invoke_models` exposes a `run_model_suite` helper.  It orchestrates the SAR-PU, Jiang ridge, and Jiang logistic replications one-by-one (skipping the old aggregation code) and returns the directories containing the generated metrics CSVs, yearly confusion matrices, Figure 3 panels, and Table 3 summaries:
+For programmatic reproducibility (including rolling vs. expanding windows, winsorisation, and class-imbalance controls), the module `sarpu.sarpu.invoke_models` provides `run_sarpu_static` and `run_sarpu_windows` helpers. They return the directories containing the generated metrics CSVs, yearly confusion matrices, Figure 3 panels, Table 3 summaries, and rank-correlation heatmaps:
 
 ```python
-from sarpu.sarpu.invoke_models import run_model_suite
+from sarpu.sarpu.invoke_models import run_sarpu_windows
 
-outputs = run_model_suite(
-    sarpu_features_with_labels={"intangibility": "Intangibility", "cf_at": "Cashflow / Assets"},
-    jiang_ridge_predictors=["intangibility", "cf_at", "firm_size_ln"],
-    jiang_logit_features=["intangibility", "cf_at", "firm_size_ln"],
+artefacts = run_sarpu_windows(
+    features_with_labels={
+        "intangibility": "Intangibility",
+        "cf_at": "Cashflow / Assets",
+        "firm_size_ln": "Firm size (log)",
+    },
+    window_types=("rolling", "expanding"),
 )
 
-print(outputs["sarpu_static"]["main_2007_2018"]["sarpu_static"])
+print(artefacts["rolling"]["main_2007_2018"]["sarpu_static"])
 ```
 
-Each key maps to the artefacts for that particular model/run so you can inspect the generated figures or reuse the CSV files in custom reports.
+Each window strategy receives its own output folder so you can inspect or reuse the CSV/figure outputs in downstream analysis.
 
 
 #### Output

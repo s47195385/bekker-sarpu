@@ -1,17 +1,15 @@
 """Utilities to run SAR-PU compatible models individually.
 
 This module re-packages the bespoke experiment harness that the user provided
-in order to make it easier to trigger each experiment separately.  The
-functions here intentionally mirror the original script structure so existing
-configuration dictionaries keep working, but the orchestration helpers now
-return outputs per model without relying on the aggregation routines that were
-previously embedded at the bottom of the script.
+in order to make it easier to trigger SAR-PU experiments programmatically.
+The helpers mirror the structure of the original script so existing
+configuration dictionaries keep working, but they now focus solely on SAR-PU
+pipelines while still producing the familiar figures and tables for each run.
 
-The entry point most users will want is :func:`run_model_suite`, which accepts
-explicit feature/parameter selections for the SAR-PU, Jiang ridge, and Jiang
-logistic variants and executes the selected pipelines one-by-one.  Each runner
-captures the metrics, figures, and tabular artefacts that are produced during
-execution so callers can inspect or post-process the generated material.
+The main entry points are :func:`run_sarpu_static` (single configuration) and
+:func:`run_sarpu_windows` (multiple rolling/expanding passes).  Both return the
+paths to the generated artefacts so callers can post-process the CSV outputs or
+embed the saved figures directly in reports.
 """
 
 from __future__ import annotations
@@ -31,7 +29,7 @@ import seaborn as sns
 from joblib import Parallel, delayed
 from matplotlib import pyplot as plt
 from scipy import stats
-from sklearn.linear_model import LogisticRegression, SGDClassifier
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     accuracy_score,
     average_precision_score,
@@ -44,8 +42,8 @@ from sklearn.metrics import (
     recall_score,
     roc_auc_score,
 )
-from sklearn.model_selection import RandomizedSearchCV, StratifiedKFold, StratifiedShuffleSplit
-from sklearn.preprocessing import PolynomialFeatures, StandardScaler
+from sklearn.model_selection import StratifiedKFold, StratifiedShuffleSplit
+from sklearn.preprocessing import StandardScaler
 
 warnings.filterwarnings("ignore")
 np.seterr(all="ignore")
@@ -146,26 +144,6 @@ class Config:
     cv_model_selection: str = "ba"
     pp_rate_cap: float | None = None
     threshold_ema_alpha: float | None = None
-    jiang_predictors: Sequence[str] = (
-        "intangibility",
-        "capx_at",
-        "cf_at",
-        "firm_size_ln",
-        "net_worth",
-        "r_and_d",
-        "roa",
-        "tobins_q",
-        "sale_growth",
-        "ww_fc",
-        "exret_ffyear_bhr",
-        "age_ln_ipo",
-        "flor__risk_length",
-        "qjiang__nist_counts",
-    )
-    jiang_cv_folds: int = 5
-    jiang_search_samples: int = 100
-    jiang_n_jobs: int = -1
-    jiang_max_iter: int = 10_000
 
 
 def _load_dataset(cfg: Config, feature_cols_union: List[str]) -> tuple[pd.DataFrame, List[str]]:
@@ -1393,148 +1371,6 @@ def save_table_pairwise_with_diffs(
         fh.write("\n".join(lines) + "\n")
 
 
-def _run_jiang_logistic_rolling(df: pd.DataFrame, cfg: Config, *, feature_names: Sequence[str]) -> Dict[str, Any]:
-    folds: List[Dict[str, Any]] = []
-    metrics_rows: List[Dict[str, Any]] = []
-    predictors = [c for c in feature_names if c in df.columns]
-    years = sorted(df["ffyear"].unique())
-    frames_by_year = {y: df.loc[df["ffyear"] == y].reset_index(drop=True) for y in years}
-    for year in range(cfg.start_year, cfg.end_year):
-        if year not in frames_by_year or (year + 1) not in frames_by_year:
-            continue
-        tr = frames_by_year[year]
-        te = frames_by_year[year + 1]
-        Xtr = tr[predictors].to_numpy(float)
-        ytr = tr[cfg.target_col].to_numpy(int).ravel()
-        Xte = te[predictors].to_numpy(float)
-        yte = te[cfg.target_col].to_numpy(int).ravel()
-        lo = float(getattr(cfg, "winsor_lo", 0.01))
-        hi = float(getattr(cfg, "winsor_hi", 0.99))
-        Xtr, Xte = _winsorize_train_apply(Xtr, Xte, lo=lo, hi=hi)
-        scaler = StandardScaler().fit(Xtr)
-        XtrT = scaler.transform(Xtr)
-        XteT = scaler.transform(Xte)
-        clf = LogisticRegression(penalty=None, max_iter=10_000, n_jobs=-1, random_state=42)
-        clf.fit(XtrT, ytr)
-        proba = clf.predict_proba(XteT)[:, 1]
-        yhat = clf.predict(XteT)
-        met = _compute_metrics(yte, proba, yhat)
-        met.update({"train_year": year, "test_year": year + 1})
-        metrics_rows.append(met)
-        folds.append(
-            {
-                "train_year": year,
-                "test_year": year + 1,
-                "scores": proba,
-                "y_true": yte,
-                "y_pred": yhat,
-            }
-        )
-        log.info("[Jiang logit] %d→%d OOS_BA=%.4f", year, year + 1, met["f_balanced_accuracy"])
-    return {
-        "metrics_df": pd.DataFrame(metrics_rows).sort_values("test_year"),
-        "folds": folds,
-        "predictors_used": predictors,
-    }
-
-
-def _run_jiang_ridge_rolling(df: pd.DataFrame, cfg: Config, *, logger: Optional[logging.Logger] = None) -> Dict[str, Any]:
-    lg = logger or log
-    lg.info("Starting Jiang ridge replication. predictors=%d", len(cfg.jiang_predictors))
-    metrics_records: List[Dict[str, Any]] = []
-    folds: List[Dict[str, Any]] = []
-    years = sorted(df["ffyear"].unique())
-    frames_by_year = {y: df.loc[df["ffyear"] == y].reset_index(drop=True) for y in years}
-    predictors = [c for c in cfg.jiang_predictors if c in df.columns]
-    target = cfg.target_col
-    poly = PolynomialFeatures(cfg.poly_degree)
-    for year in range(cfg.start_year, cfg.end_year):
-        if year not in frames_by_year or (year + 1) not in frames_by_year:
-            continue
-        df_train = frames_by_year[year]
-        df_test = frames_by_year[year + 1]
-        X_train = df_train[predictors].to_numpy(dtype=float)
-        y_train = df_train[target].to_numpy(dtype=int).ravel()
-        X_test = df_test[predictors].to_numpy(dtype=float)
-        y_test = df_test[target].to_numpy(dtype=int).ravel()
-        lg.info(
-            "Year %s→%s, n_train=%d, n_test=%d, base p(test)=%.4f",
-            year,
-            year + 1,
-            len(X_train),
-            len(X_test),
-            y_test.mean(),
-        )
-        lo = float(getattr(cfg, "winsor_lo", 0.01))
-        hi = float(getattr(cfg, "winsor_hi", 0.99))
-        X_train, X_test = _winsorize_train_apply(X_train, X_test, lo=lo, hi=hi)
-        X_train_poly = poly.fit_transform(X_train)
-        X_test_poly = poly.transform(X_test)
-        scaler = StandardScaler().fit(X_train_poly)
-        X_train_T = scaler.transform(X_train_poly)
-        X_test_T = scaler.transform(X_test_poly)
-        params = {
-            "class_weight": [{0: w} for w in np.linspace(0.01, 0.99, num=101)],
-            "alpha": np.logspace(-4, 4, num=101),
-            "validation_fraction": np.linspace(0.1, 0.4, num=7),
-            "tol": [1e-3, 1e-4, 1e-5],
-        }
-        ridge = SGDClassifier(
-            loss="log_loss",
-            penalty="l2",
-            max_iter=cfg.jiang_max_iter,
-            early_stopping=True,
-            random_state=cfg.random_state,
-        )
-        clf = RandomizedSearchCV(
-            ridge,
-            params,
-            random_state=cfg.random_state,
-            n_iter=min(cfg.jiang_search_samples, 100),
-            scoring="balanced_accuracy",
-            n_jobs=cfg.jiang_n_jobs,
-            cv=cfg.jiang_cv_folds,
-            verbose=0,
-        )
-        search = clf.fit(X_train_T, y_train)
-        best = search.best_estimator_
-        lg.info(
-            "Best alpha=%s class_weight=%s val_frac=%s tol=%s",
-            getattr(best, "alpha", None),
-            getattr(best, "class_weight", None),
-            getattr(best, "validation_fraction", None),
-            getattr(best, "tol", None),
-        )
-        y_pred = best.predict(X_test_T)
-        if hasattr(best, "predict_proba"):
-            y_pred_proba = best.predict_proba(X_test_T)[:, 1]
-        else:
-            z = best.decision_function(X_test_T)
-            y_pred_proba = 1.0 / (1.0 + np.exp(-z))
-        met = _compute_metrics(y_test, y_pred_proba, y_pred, aul_k=getattr(cfg, "aul_k", 0.10))
-        met.update({"train_year": year, "test_year": year + 1})
-        lg.info(
-            "Metrics AUC=%.3f F1=%.3f BA=%.3f AUL=%.3f",
-            met["f_roc_auc"],
-            met["f_f1"],
-            met["f_balanced_accuracy"],
-            met["f_aul"],
-        )
-        metrics_records.append(met)
-        folds.append(
-            {
-                "train_year": year,
-                "test_year": year + 1,
-                "scores": y_pred_proba,
-                "y_true": y_test,
-                "y_pred": y_pred,
-            }
-        )
-    metrics_df = pd.DataFrame(metrics_records).sort_values("test_year")
-    lg.info("Finished Jiang ridge.")
-    return {"metrics_df": metrics_df, "folds": folds, "predictors_used": predictors}
-
-
 def run_sarpu_static(
     *,
     features_with_labels: Mapping[str, str],
@@ -1759,209 +1595,52 @@ def run_sarpu_static(
     return outputs
 
 
-def run_jiang_ridge(
+def run_sarpu_windows(
     *,
-    predictors: Sequence[str],
-    start_year: int = 2007,
-    end_year: int = 2023,
-    random_state: int = 42,
-    results_dir: str | Path = "./results-thesis/jiang_ridge",
+    features_with_labels: Mapping[str, str],
+    window_types: Sequence[str] = ("rolling", "expanding"),
+    results_dir: str | Path = "./results-thesis/sarpu_windows",
     cfg_overrides: Optional[Dict[str, Any]] = None,
-    windows: Sequence[Tuple[str, int]] = (("main_2007_2018", 2018), ("extended_2007_2023", 2023)),
     logger: Optional[logging.Logger] = None,
-) -> Dict[str, Dict[str, Path]]:
-    lg = logger or logging.getLogger(__name__)
-    cfg_kwargs = dict(
-        jiang_predictors=list(predictors),
-        start_year=start_year,
-        end_year=end_year,
-        random_state=random_state,
-        results_dir=str(results_dir),
-    )
-    if cfg_overrides:
-        cfg_kwargs.update(cfg_overrides)
-    cfg = Config(**cfg_kwargs)
-
-    globals().update(
-        {
-            "Folds": getattr(cfg, "jiang_cv_folds", 5),
-            "Samples": getattr(cfg, "jiang_search_samples", 100),
-            "No_cores": getattr(cfg, "jiang_n_jobs", -1),
-            "Max_iter": getattr(cfg, "jiang_max_iter", 10_000),
-        }
-    )
-
-    df, _ = _load_dataset(cfg, list(set(predictors)))
-    result = _run_jiang_ridge_rolling(df, cfg, logger=lg)
-
-    outputs: Dict[str, Dict[str, Path]] = {}
-    for tag, end_year_cap in windows:
-        out_dir = Path(cfg.results_dir) / tag
-        ensure_directory(out_dir)
-
-        df_metrics = result["metrics_df"].copy()
-        df_metrics = df_metrics[(df_metrics["test_year"] >= 2008) & (df_metrics["test_year"] <= end_year_cap)]
-
-        _write_metrics_csv(df_metrics, out_dir, logger=lg)
-        _write_yearly_confusion(result["folds"], out_dir, logger=lg)
-
-        empty = pd.DataFrame()
-        save_figure3_over_time(
-            empty,
-            df_metrics,
-            empty,
-            out_dir / "figure3.png",
-            logger=lg,
-            single_model_label="Jiang ridge",
-            cols=2,
-        )
-        save_table_means_2008_2018(empty, df_metrics, empty, out_dir / "table3.txt", logger=lg)
-
-        frames_by_year = {y: df.loc[df["ffyear"] == y].reset_index(drop=True) for y in sorted(df["ffyear"].unique())}
-        jiang_scores_by_year = {fold["test_year"]: fold["scores"] for fold in result["folds"]}
-        pretty_map = {p: p for p in predictors}
-        save_rankcorr_heatmaps(
-            {},
-            jiang_scores_by_year,
-            frames_by_year,
-            [],
-            list(result.get("predictors_used", predictors)),
-            pretty_map,
-            out_dir,
-            logger=lg,
-        )
-
-        outputs.setdefault(tag, {})["jiang_ridge"] = out_dir
-    return outputs
-
-
-def run_jiang_logit(
-    *,
-    feature_names: Sequence[str],
-    start_year: int = 2007,
-    end_year: int = 2023,
-    random_state: int = 42,
-    results_dir: str | Path = "./results-thesis/jiang_logit",
-    cfg_overrides: Optional[Dict[str, Any]] = None,
-    windows: Sequence[Tuple[str, int]] = (("main_2007_2018", 2018), ("extended_2007_2023", 2023)),
-    logger: Optional[logging.Logger] = None,
-) -> Dict[str, Dict[str, Path]]:
-    lg = logger or logging.getLogger(__name__)
-    cfg_kwargs = dict(
-        start_year=start_year,
-        end_year=end_year,
-        random_state=random_state,
-        results_dir=str(results_dir),
-    )
-    if cfg_overrides:
-        cfg_kwargs.update(cfg_overrides)
-    cfg = Config(**cfg_kwargs)
-
-    df, _ = _load_dataset(cfg, list(set(feature_names)))
-    result = _run_jiang_logistic_rolling(df, cfg, feature_names=feature_names)
-
-    outputs: Dict[str, Dict[str, Path]] = {}
-    for tag, end_year_cap in windows:
-        out_dir = Path(cfg.results_dir) / tag
-        ensure_directory(out_dir)
-
-        df_metrics = result["metrics_df"].copy()
-        df_metrics = df_metrics[(df_metrics["test_year"] >= 2008) & (df_metrics["test_year"] <= end_year_cap)]
-
-        _write_metrics_csv(df_metrics, out_dir, logger=lg)
-        _write_yearly_confusion(result["folds"], out_dir, logger=lg)
-
-        empty = pd.DataFrame()
-        save_figure3_over_time(
-            empty,
-            empty,
-            df_metrics,
-            out_dir / "figure3.png",
-            logger=lg,
-            single_model_label="Jiang logistic",
-            cols=2,
-        )
-        save_table_means_2008_2018(empty, empty, df_metrics, out_dir / "table3.txt", logger=lg)
-
-        frames_by_year = {y: df.loc[df["ffyear"] == y].reset_index(drop=True) for y in sorted(df["ffyear"].unique())}
-        jiang_scores_by_year = {fold["test_year"]: fold["scores"] for fold in result["folds"]}
-        pretty_map = {f: f for f in feature_names}
-        save_rankcorr_heatmaps(
-            {},
-            jiang_scores_by_year,
-            frames_by_year,
-            [],
-            list(result.get("predictors_used", feature_names)),
-            pretty_map,
-            out_dir,
-            logger=lg,
-        )
-
-        outputs.setdefault(tag, {})["jiang_logit"] = out_dir
-    return outputs
-
-
-def run_model_suite(
-    *,
-    sarpu_features_with_labels: Mapping[str, str],
-    jiang_ridge_predictors: Sequence[str],
-    jiang_logit_features: Sequence[str],
-    sarpu_kwargs: Optional[Dict[str, Any]] = None,
-    jiang_ridge_kwargs: Optional[Dict[str, Any]] = None,
-    jiang_logit_kwargs: Optional[Dict[str, Any]] = None,
-    run_sarpu: bool = True,
-    run_ridge: bool = True,
-    run_logit: bool = True,
-    logger: Optional[logging.Logger] = None,
+    **kwargs: Any,
 ) -> Dict[str, Dict[str, Dict[str, Path]]]:
-    """Execute the requested models sequentially and return their artefact paths.
+    """Run SAR-PU experiments for multiple window strategies.
 
     Parameters
     ----------
-    sarpu_features_with_labels:
-        Mapping of feature column name to a human friendly label for the SAR-PU
-        experiment.
-    jiang_ridge_predictors:
-        Predictors used by the Jiang ridge replication.
-    jiang_logit_features:
-        Predictors used by the Jiang logistic replication.
-    sarpu_kwargs, jiang_ridge_kwargs, jiang_logit_kwargs:
-        Optional dictionaries with extra keyword arguments forwarded to
-        :func:`run_sarpu_static`, :func:`run_jiang_ridge` and
-        :func:`run_jiang_logit` respectively.  This allows callers to tweak
-        output directories, year ranges, or hyper-parameters without editing the
-        helper.
-    run_sarpu, run_ridge, run_logit:
-        Booleans controlling which experiments to launch.
+    features_with_labels:
+        Mapping of feature column name to a pretty label.
+    window_types:
+        Iterable containing the window_type values to evaluate (e.g. ``("rolling",
+        "expanding")``).
+    results_dir:
+        Base directory under which per-window outputs will be stored.  Each
+        window strategy receives its own sub-folder to avoid clobbering results.
+    cfg_overrides:
+        Optional dictionary merged into the :class:`Config` used for each
+        invocation.
     logger:
-        Optional logger used for high-level messages.
+        Optional logger for status updates.
+    **kwargs:
+        Additional keyword arguments forwarded to :func:`run_sarpu_static`.
     """
 
     lg = logger or logging.getLogger(__name__)
     outputs: Dict[str, Dict[str, Dict[str, Path]]] = {}
+    base_overrides = dict(cfg_overrides or {})
+    base_results = Path(results_dir)
 
-    if run_sarpu:
-        lg.info("[run_model_suite] Launching SAR-PU experiment")
-        outputs["sarpu_static"] = run_sarpu_static(
-            features_with_labels=sarpu_features_with_labels,
-            **(sarpu_kwargs or {}),
+    for win_type in window_types:
+        lg.info("[run_sarpu_windows] executing window_type=%s", win_type)
+        subdir = base_results / win_type
+        overrides = dict(base_overrides)
+        outputs[win_type] = run_sarpu_static(
+            features_with_labels=features_with_labels,
+            window_type=win_type,
+            results_dir=subdir,
+            cfg_overrides=overrides,
             logger=lg,
-        )
-
-    if run_ridge:
-        lg.info("[run_model_suite] Launching Jiang ridge experiment")
-        outputs["jiang_ridge"] = run_jiang_ridge(
-            predictors=jiang_ridge_predictors,
-            **(jiang_ridge_kwargs or {}),
-            logger=lg,
-        )
-
-    if run_logit:
-        lg.info("[run_model_suite] Launching Jiang logistic experiment")
-        outputs["jiang_logit"] = run_jiang_logit(
-            feature_names=jiang_logit_features,
-            **(jiang_logit_kwargs or {}),
-            logger=lg,
+            **kwargs,
         )
 
     return outputs
@@ -1970,11 +1649,10 @@ def run_model_suite(
 __all__ = [
     "Config",
     "run_sarpu_static",
-    "run_jiang_ridge",
-    "run_jiang_logit",
-    "run_model_suite",
+    "run_sarpu_windows",
     "export_pu_scores_from_folds",
     "save_figure3_over_time",
+    "save_figure3_over_time_multi",
     "save_table_means_2008_2018",
     "save_rankcorr_heatmaps",
     "save_table_pairwise_with_diffs",
