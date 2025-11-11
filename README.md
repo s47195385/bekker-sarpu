@@ -119,7 +119,11 @@ The labellings are saved in the data director under `<dataset>/processed/labelin
 - `propensity_attributes`: 1.-3.5 for attributes [1,3,5] and signs [1,-1,1].
 - `labeling`: which labeling to use (id)
 - `partition`: which train/test partition to use (id)
-- `settings`: Which settings to use, i.e. which type of model for classification, which type of model for propensity scores and which attributes to use for classification. The three values are separated by `._.`. The models  can be "lr"  (Logistic regression) and the classification attributes are either "all"  or something like "1.3-5.9-11" which indicates that attributes [1,3,4,5,9,10,11] should be used for classification.
+- `settings`: Which settings to use, i.e. which type of model for classification, which type of model for propensity scores and which attributes to use for classification. The three values are separated by `._.`. The models can be:
+    - `lr`: logistic regression (supports the standard SAR-PU configuration and allows `n_jobs=-1` for parallelism).
+    - `rf`: random forest classifier tailored for PU learning with propensity weighting and multi-core support (`n_jobs=-1` by default).
+    - `et`: extremely randomized trees (ExtraTrees) configured for PU learning and full CPU utilisation out of the box.
+  The classification attributes are either `all` or something like `1.3-5.9-11` which indicates that attributes [1,3,4,5,9,10,11] should be used for classification.
 - `pu_method`: which pu_method to use
     - `supervised`: standard supervised learning with access to the true labels
     - `negative`: standard supervised learning given the PU labels
@@ -128,6 +132,24 @@ The labellings are saved in the data director under `<dataset>/processed/labelin
     - `sar-em`: The EM-based SAR-PU method
     - `scar-km2`: propensity score weighting with an estimated label frequency as the propensity score for all examples. km2 is used to estimate the label frequency.
     - `scar-tice`: propensity score weighting with an estimated label frequency as the propensity score for all examples. tice is used to estimate the label frequency.
+
+For programmatic workflows, the helper `sarpu.pu_learning.run_sar_em_pipeline` wraps `pu_learn_sar_em` so you can supply the dataset, propensity configuration, model aliases (or fully specified estimators), threshold objectives, and any estimator arguments (such as `n_jobs=-1`) through a single call. The function returns a dictionary with the fitted classification model, propensity model and the training metadata.
+
+If you prefer to reproduce the Jiang et al. figures/tables independently for each classifier, the module `sarpu.sarpu.invoke_models` exposes a `run_model_suite` helper.  It orchestrates the SAR-PU, Jiang ridge, and Jiang logistic replications one-by-one (skipping the old aggregation code) and returns the directories containing the generated metrics CSVs, yearly confusion matrices, Figure 3 panels, and Table 3 summaries:
+
+```python
+from sarpu.sarpu.invoke_models import run_model_suite
+
+outputs = run_model_suite(
+    sarpu_features_with_labels={"intangibility": "Intangibility", "cf_at": "Cashflow / Assets"},
+    jiang_ridge_predictors=["intangibility", "cf_at", "firm_size_ln"],
+    jiang_logit_features=["intangibility", "cf_at", "firm_size_ln"],
+)
+
+print(outputs["sarpu_static"]["main_2007_2018"]["sarpu_static"])
+```
+
+Each key maps to the artefacts for that particular model/run so you can inspect the generated figures or reuse the CSV files in custom reports.
 
 
 #### Output
